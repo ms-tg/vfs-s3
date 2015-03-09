@@ -20,6 +20,7 @@ import java.util.Arrays;
 import java.util.Locale;
 import java.util.Properties;
 import java.util.Random;
+import java.util.stream.Collectors;
 
 import static com.amazonaws.services.s3.model.ObjectMetadata.AES_256_SERVER_SIDE_ENCRYPTION;
 import static com.intridea.io.vfs.FileAssert.assertHasChildren;
@@ -249,6 +250,42 @@ public class S3ProviderTest {
         dest.copyFrom(src, Selectors.SELECT_SELF);
 
         assertTrue(dest.exists() && dest.getType().equals(FileType.FILE));
+    }
+
+    // Try to reproduce what we've seen in production
+    //   - begin big file upload to S3
+    //   - block all https packets via iptables for a few seconds
+    //   - see a successful 0-byte upload to S3 instead of a failure
+    @Test //(dependsOnMethods={"createFileOk"})
+    public void uploadBigFileWithBriefNetworkFailure() throws InterruptedException, IOException {
+        FileSystemOptions fso = (FileSystemOptions) S3FileProvider.getDefaultFileSystemOptions().clone();
+        S3FileSystemConfigBuilder.getInstance().setMaxUploadThreads(fso, bigFileMaxThreads);
+
+        FileObject dest = fsManager.resolveFile("s3://" + bucketName + "/" + BIG_FILE);
+
+        // Delete file if exists
+        if (dest.exists()) {
+            dest.delete();
+        }
+
+        // Copy data
+        final File file = new File(bigFile);
+
+        assertTrue(file.exists(), "Big file should exists");
+
+        FileObject src = fsManager.resolveFile(file.getAbsolutePath());
+
+        if (src.getContent().getSize() < new TransferManagerConfiguration().getMultipartUploadThreshold()) {
+            System.err.println("uploadBigFile() needs a file larger than 16MB in order to be useful");
+        }
+
+        // in the background, cause a brief network failure
+        causeBriefNetworkFailureToS3InBackground();
+
+        dest.copyFrom(src, Selectors.SELECT_SELF);
+
+        assertTrue(dest.exists() && dest.getType().equals(FileType.FILE));
+        assertTrue(dest.getContent().getSize() == file.length(), "Uploaded size should equal big file size");
     }
 
     @Test(dependsOnMethods={"createFileOk"})
@@ -598,5 +635,32 @@ public class S3ProviderTest {
                 System.err.println("Unable to close input stream of hash candidate: " + e);
             }
         }
+    }
+
+
+    private void causeBriefNetworkFailureToS3InBackground() throws InterruptedException, IOException {
+        System.err.println("Verifying that we can run `sudo iptables -L`");
+        if (runCommand("sudo iptables -L") != 0) { throw new IOException("Failed to run `sudo iptables -L`"); }
+
+        // In background: wait 1 second, then cause a brief network failure to S3, and then restore it
+        new Thread() {
+            public void run() {
+                System.err.println("Background: waiting 20 seconds");
+                try { Thread.sleep(20000); } catch (InterruptedException ex) {}
+                System.err.println("Background: cause failure for all outgoing HTTPS packets");
+                try { runCommand("sudo iptables -A OUTPUT -p tcp --dport 443 -j DROP"); } catch (InterruptedException|IOException ex) {}
+                System.err.println("Background: waiting 20 seconds");
+                try { Thread.sleep(20000); } catch (InterruptedException ex) {}
+                System.err.println("Background: restore outgoing HTTPS packets");
+                try { runCommand("sudo iptables -D OUTPUT -p tcp --dport 443 -j DROP"); } catch (InterruptedException|IOException ex) {}
+            }
+        }.start();
+    }
+
+    private int runCommand(String cmd) throws InterruptedException, IOException {
+        java.util.List<String> cmds = Arrays.asList(cmd.trim().split("\\s")).stream().map(String::trim).collect(Collectors.toList());
+        ProcessBuilder pb = new ProcessBuilder(cmds);
+        Process p = pb.start();
+        return p.waitFor();
     }
 }
